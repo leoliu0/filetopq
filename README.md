@@ -1,4 +1,4 @@
-# filetopq
+# filetopq - A simple utility to convert files to parquet, supported csv, tsv, json, Stata, SAS
 
 ## Installation
 clone this repo
