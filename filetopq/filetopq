@@ -1,0 +1,126 @@
+#!/usr/bin/python
+import re
+import argparse
+import os
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pyarrow import csv
+import pyreadstat
+from loguru import logger
+from multiprocessing import cpu_count
+
+
+chunksize = 5000000  # this is the number of lines
+
+parser = argparse.ArgumentParser()
+parser.add_argument("file")
+parser.add_argument("-t", "--type")
+parser.add_argument("--sep")
+parser.add_argument("-o", "--output")
+parser.add_argument("--skip_existing", action="store_true")
+
+args = parser.parse_args()
+
+output = args.output if args.output else args.file.rsplit(".", 1)[0] + ".pq"
+
+if args.skip_existing:
+    if os.path.isfile(output):
+        raise ValueError(f"{output} exists, skipping...")
+
+
+# if args.type not in ["csv", "sas", "json", "dta", "tsv"]:
+# sys.exit("not supported format")
+
+
+def dfname(df):
+    df.columns = [x.lower() for x in list(df)]
+    for c in list(df):
+        df.rename({c: "_".join(re.findall("\w+", c))}, axis=1, inplace=True)
+    return df
+
+
+def write_parquet(chunks, type):
+    for i, df in enumerate(chunks):
+        if type == "sas":
+            df, _ = df
+        df = dfname(df)
+        table = pa.Table.from_pandas(df)
+        # for the first chunk of records
+        if i == 0:
+            # create a parquet write object giving it an output file
+            pqwriter = pq.ParquetWriter(
+                output,
+                table.schema,
+                allow_truncated_timestamps=True,
+                use_deprecated_int96_timestamps=True,
+            )
+            pqwriter.write_table(table)
+        # subsequent chunks can be written to the same file
+        else:
+            pqwriter.write_table(table)
+    # close the parquet writer
+    if pqwriter:
+        pqwriter.close()
+
+
+def process_file(file):
+    opts = csv.ReadOptions()
+    parseOpts = csv.ParseOptions()
+    if args.sep:
+        parseOpts = csv.ParseOptions(delimiter=args.sep)
+    opts.block_size = 2_000_000_000  # 2G reading to infer type
+    opts.encoding = "latin1"
+    writer = None
+    if args.type == "csv" or re.search(r"\.csv$", args.file):
+        logger.info(f" Processing {args.file} ....")
+        with csv.open_csv(file, read_options=opts, parse_options=parseOpts) as reader:
+            for chunk in reader:
+                if chunk is None:
+                    break
+                if writer is None:
+                    writer = pq.ParquetWriter(output, chunk.schema)
+                next_table = pa.Table.from_batches([chunk])
+                writer.write_table(next_table)
+            writer.close()
+        return
+
+    if args.type == "tsv" or re.search(r"\.tsv$", args.file):
+        opts = csv.ReadOptions()
+        opts.block_size = 2_000_000_000  # 2G reading to infer type
+        opts.encoding = "latin1"
+        writer = None
+        parseOpts = csv.ParseOptions(delimiter="\t")
+        logger.info(f" Processing {args.file} ....")
+        with csv.open_csv(file, read_options=opts,parse_options=parseOpts) as reader:
+            for chunk in reader:
+                if chunk is None:
+                    break
+                if writer is None:
+                    writer = pq.ParquetWriter(output, chunk.schema)
+                next_table = pa.Table.from_batches([chunk])
+                writer.write_table(next_table)
+            writer.close()
+        return
+    if args.type == "sas" or re.search(r"\.sas.*", args.file):
+        logger.info(f" Processing {args.file} ....")
+        chunks = pyreadstat.read_file_in_chunks(
+            pyreadstat.read_sas7bdat, file, multiprocess=True, num_processes=cpu_count()
+        )
+        write_parquet(chunks, "sas")
+        return
+    if args.type == "json" or re.search("\.json$", args.file):
+        logger.info(f" Processing {args.file} ....")
+        chunks = pd.read_json(file, lines=True, chunksize=chunksize, encoding="latin1")
+        write_parquet(chunks, "json")
+        return
+    if args.type == "dta" or re.search(r"\.dta$", args.file):
+        logger.info(f" Processing {args.file} ....")
+        dfname(pd.read_stata(file)).to_parquet(output)
+        return
+    raise ValueError("not supported format")
+
+
+if __name__ == "__main__":
+    process_file(args.file)
+    logger.info(f"finished processing {args.file}, produced {output} ....")
